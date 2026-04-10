@@ -1,0 +1,128 @@
+#include <stdio.h>
+#include "pico/stdlib.h"
+#include "hardware/adc.h"
+#include "hardware/pwm.h"
+
+// ================= PIN CONFIG =================
+#define SERVO_PWM_PIN 0
+#define SERVO_EN_PIN  6
+
+#define MUX_S0 26
+#define MUX_S1 27
+#define MUX_S2 28
+#define CURRENT_ADC 29
+
+// ================= PARAMETERS =================
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 2500
+#define PWM_FREQ 50
+
+#define MAX_CURRENT 2.0f   // Amps (adjust!)
+#define TORQUE_CONSTANT 0.12f // Nm/A (example)
+
+// ================= GLOBAL =================
+float current_angle = 90.0f;
+
+// ================= PWM INIT =================
+void pwm_init_servo(uint pin) {
+    gpio_set_function(pin, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(pin);
+
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv(&config, 125.0f); // 1 MHz base
+    pwm_config_set_wrap(&config, 20000);    // 20 ms period
+
+    pwm_init(slice, &config, true);
+}
+
+// ================= SET SERVO =================
+void set_servo_angle(uint pin, float angle) {
+    float pulse = SERVO_MIN_US + (angle / 180.0f) * (SERVO_MAX_US - SERVO_MIN_US);
+    uint slice = pwm_gpio_to_slice_num(pin);
+    pwm_set_gpio_level(pin, (uint16_t)pulse);
+}
+
+// ================= MUX =================
+void select_channel(uint8_t ch) {
+    gpio_put(MUX_S0, ch & 1);
+    gpio_put(MUX_S1, (ch >> 1) & 1);
+    gpio_put(MUX_S2, (ch >> 2) & 1);
+}
+
+// ================= CURRENT READ =================
+float read_current() {
+    adc_select_input(3); // GPIO29
+    uint16_t raw = adc_read();
+    float voltage = raw * 3.3f / 4096.0f;
+
+    // Convert (depends on your amplifier gain!)
+    float current = voltage / 0.1f; // example scaling
+    return current;
+}
+
+// ================= TORQUE =================
+float estimate_torque(float current) {
+    return current * TORQUE_CONSTANT;
+}
+
+// ================= MOVE WITH CONTROL =================
+void move_servo_smart(float target_angle, float speed_deg_per_sec) {
+
+    float step = (target_angle > current_angle) ? 1.0f : -1.0f;
+    float delay_ms = 1000.0f / speed_deg_per_sec;
+
+    while ((step > 0 && current_angle < target_angle) ||
+           (step < 0 && current_angle > target_angle)) {
+
+        current_angle += step;
+
+        set_servo_angle(SERVO_PWM_PIN, current_angle);
+
+        // Read feedback
+        select_channel(0); // servo 1
+        sleep_ms(2);
+        float current = read_current();
+        float torque = estimate_torque(current);
+
+        printf("Angle: %.2f | Current: %.2fA | Torque: %.2fNm\n",
+               current_angle, current, torque);
+
+        // 🔴 SAFETY
+        if (current > MAX_CURRENT) {
+            printf("!!! OVERCURRENT - STOP !!!\n");
+            gpio_put(SERVO_EN_PIN, 0); // disable servo
+            return;
+        }
+
+        sleep_ms((int)delay_ms);
+    }
+}
+
+// ================= MAIN =================
+int main() {
+    stdio_init_all();
+
+    // GPIO init
+    gpio_init(SERVO_EN_PIN);
+    gpio_set_dir(SERVO_EN_PIN, GPIO_OUT);
+    gpio_put(SERVO_EN_PIN, 1);
+
+    gpio_init(MUX_S0); gpio_set_dir(MUX_S0, GPIO_OUT);
+    gpio_init(MUX_S1); gpio_set_dir(MUX_S1, GPIO_OUT);
+    gpio_init(MUX_S2); gpio_set_dir(MUX_S2, GPIO_OUT);
+
+    adc_init();
+    adc_gpio_init(CURRENT_ADC);
+
+    pwm_init_servo(SERVO_PWM_PIN);
+
+    while (1) {
+        printf("Moving to 150°...\n");
+        move_servo_smart(150, 60); // 60 deg/sec
+        sleep_ms(2000);
+
+        printf("Moving to 30°...\n");
+        move_servo_smart(30, 30);
+        sleep_ms(2000);
+    }
+}
